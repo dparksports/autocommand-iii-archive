@@ -38,6 +38,7 @@ const string OfflineToolsJson = """
   { "name": "list_blocks", "description": "Inventory of every AutoCommand firewall block with recent hit counts (needs an active session)." },
   { "name": "open_gate", "description": "Temporarily stop blocking ONE specific blocked IP/process for 1/10/30/60 minutes (user-confirmed; auto-restores; dry_run previews) (needs an active session)." },
   { "name": "close_gate", "description": "Close an open block gate early - blocking returns ON now (needs an active session)." },
+  { "name": "sever_blocked", "description": "Close the running instances of ONE blocked process / connection owners of ONE blocked IP, severing established flows the block rule cannot touch (user-confirmed; dry_run previews) (needs an active session)." },
   { "name": "list_gates", "description": "Open block gates with remaining minutes, requester and reason (needs an active session)." },
   { "name": "list_recent_block_hits", "description": "Live process-attributed feed of connects hitting firewall blocks — the 'who is being blocked' view (needs an active session)." },
   { "name": "verify_block_containment", "description": "Prove blocked processes are silent, not just trying: block attempts joined against live sockets and archived transmissions since block creation (needs an active session)." },

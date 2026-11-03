@@ -453,6 +453,48 @@ Check("dup: mixed identities sum per-identity redundants",
       D("n", "n", "m", "m", "m") == 3);
 Check("dup: empty input is clean", D(Array.Empty<string>()) == 0);
 
+// ─────────────────────────────────────────────────────────────────────
+// 9. Sever-on-block — the kill policy tiers and the pure plan matrix.
+//    A fresh block rule stops NEW connections only; closing the owning
+//    processes is the userspace lever that severs established flows.
+//    The tiers decide WHO may be closed — this matrix is the safety
+//    contract, so it is pinned offline exactly like the containment
+//    verdicts above. The live halves (kernel snapshot, tree-kill) are
+//    exercised by the app; the Execute pid-reuse guard re-checks the
+//    image name at kill time by design, so a recycled pid is never shot.
+// ─────────────────────────────────────────────────────────────────────
+Check("sever: lsass is never-kill (OS-critical)",
+      ProcessKillPolicy.TierFor("lsass") == ProcessKillPolicy.Never &&
+      ProcessKillPolicy.TierFor("lsass.exe") == ProcessKillPolicy.Never);
+Check("sever: services/svchost/csrss are never-kill",
+      ProcessKillPolicy.TierFor("services") == ProcessKillPolicy.Never &&
+      ProcessKillPolicy.TierFor("svchost.exe") == ProcessKillPolicy.Never &&
+      ProcessKillPolicy.TierFor("csrss") == ProcessKillPolicy.Never);
+Check("sever: Defender engine is ask-tier",
+      ProcessKillPolicy.TierFor("MsMpEng") == ProcessKillPolicy.Ask);
+Check("sever: webview/shell components are ask-tier",
+      ProcessKillPolicy.TierFor("msedgewebview2.exe") == ProcessKillPolicy.Ask &&
+      ProcessKillPolicy.TierFor("SearchHost") == ProcessKillPolicy.Ask);
+Check("sever: ordinary app is allowed", ProcessKillPolicy.TierFor("chrome") == ProcessKillPolicy.Allowed);
+Check("sever: unknown name is allowed (block rule protects regardless)",
+      ProcessKillPolicy.TierFor("totally-unknown-app") == ProcessKillPolicy.Allowed);
+Check("sever: unreadable identity asks (never assume safe)",
+      ProcessKillPolicy.TierFor("") == ProcessKillPolicy.Ask &&
+      ProcessKillPolicy.TierFor(null) == ProcessKillPolicy.Ask);
+
+// the plan decision matrix — pure, so the whole safety table is here
+Check("sever plan: never-tier refused even WITH consent",
+      SeverService.PlanDecision(ProcessKillPolicy.Never, 4321, allowAskTier: true) != null);
+Check("sever plan: ask-tier refused WITHOUT consent",
+      SeverService.PlanDecision(ProcessKillPolicy.Ask, 4321, allowAskTier: false) != null);
+Check("sever plan: ask-tier killable WITH consent (the dialog listed it)",
+      SeverService.PlanDecision(ProcessKillPolicy.Ask, 4321, allowAskTier: true) == null);
+Check("sever plan: allowed-tier killable without extra consent",
+      SeverService.PlanDecision(ProcessKillPolicy.Allowed, 4321, allowAskTier: false) == null);
+Check("sever plan: system pid refused even in the allowed tier",
+      SeverService.PlanDecision(ProcessKillPolicy.Allowed, 4, allowAskTier: true) != null &&
+      SeverService.PlanDecision(ProcessKillPolicy.Allowed, 0, allowAskTier: true) != null);
+
 Console.WriteLine();
 Console.WriteLine(failures == 0 ? "ALL CONTAIN SELF-TESTS PASSED" : $"{failures} CHECK(S) FAILED");
 return failures == 0 ? 0 : 1;

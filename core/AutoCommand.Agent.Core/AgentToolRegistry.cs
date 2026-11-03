@@ -152,8 +152,10 @@ namespace AutoCommand.Agent.Core
                 "list_blocks",
                 "Inventory of every AutoCommand firewall block (the Blocks tab's data): per target — kind, " +
                 "owner class, enabled/total rules, created time and recent hit counts from the live " +
-                "Sysmon-joined feed. This is the authoritative 'is it blocked' source: classify_ip's range " +
-                "answer alone cannot see explicit blocked-list entries.",
+                "Sysmon-joined feed. live_instances/flows carry what a sever would close: running instances " +
+                "of the blocked name (app rows) or established connections to the IP (ip rows) — the flows a " +
+                "fresh block rule cannot touch. This is the authoritative 'is it blocked' source: classify_ip's " +
+                "range answer alone cannot see explicit blocked-list entries.",
                 Schema(("minutes", "Hit-count lookback window in minutes (default 60)", false)),
                 false,
                 a => ListBlocks(a)),
@@ -293,7 +295,8 @@ namespace AutoCommand.Agent.Core
                 "Composite read-only investigation of one process in a single call — the whole " +
                 "'why is this transmitting?' playbook: PID provenance (who launched it, PID-recycle " +
                 "guard), traffic profile over the lookback window (frequency, destinations with " +
-                "classification, beacon regularity, recorded TLS volume, live connections), AutoCommand " +
+                "classification, beacon regularity, recorded TLS volume, live connections), live UDP " +
+                "endpoints (bound sockets — bound ≠ transmitting), AutoCommand " +
                 "block-hit check, and a synthesized verdict ('internal-only', 'outbound attempts none " +
                 "completed', 'actively blocked', 'quiet') plus a plain-text report. Needs a PID for the " +
                 "provenance half; a name alone still gets the full traffic picture. Hours default 6 " +
@@ -343,6 +346,22 @@ namespace AutoCommand.Agent.Core
                 true,
                 a => CloseGate(a),
                 a => $"Close the block gate early - return blocking ON for {a["target"]} now?"),
+
+            new Tool(
+                "sever_blocked",
+                "Sever what a fresh block cannot touch: Windows Firewall rules stop NEW connections only — " +
+                "established flows keep transmitting until they die naturally. This closes the running " +
+                "instances of ONE blocked process (every path of that exe — the name-family the app blocks) " +
+                "or the processes still holding connections to ONE blocked IP. OS-critical processes " +
+                "(lsass, services, svchost…) are refused by policy and never listed; Windows components are " +
+                "listed by name and killed only when the user confirms. Kills are tree-aware (each " +
+                "instance's children close with it); anything that respawns starts clean, inside the " +
+                "block. dry_run=true lists who would be closed without acting. Asks the user for every call.",
+                Schema(("target", "One blocked target: an IP address, a process image name, or a full exe path (see list_blocks)", true),
+                       ("dry_run", "true = list what would be closed, change nothing", false)),
+                true,
+                a => SeverBlocked(a),
+                a => SeverBlockedConfirmText(a)),
 
             new Tool(
                 "close_shieldsup_door",
@@ -828,6 +847,12 @@ namespace AutoCommand.Agent.Core
             EnsureFeedStarted();
             var inv = FirewallService.Instance.GetBlockedInventoryAsync().GetAwaiter().GetResult();
             var feedHits = BlockHitFeedService.Instance.FeedHitsByIp(minutes);
+            // sever-on-block surface: one kernel+process snapshot for ALL
+            // rows — who is running under each blocked name and how many
+            // established flows each target still holds (exactly what a
+            // sever_blocked call would close; the rule alone never severs
+            // established flows).
+            var live = SeverService.TakeLiveMap();
 
             var arr = new JsonArray();
             foreach (var t in inv)
@@ -836,6 +861,14 @@ namespace AutoCommand.Agent.Core
                     t.Kind == "ip" ? "ip" : "proc",
                     t.Kind == "ip" ? t.Ip : t.AppPath);
                 int h = t.Kind == "ip" && feedHits.TryGetValue(t.Ip, out int c) ? c : 0;
+                int liveInstances = 0, flows = 0;
+                if (t.Kind == "ip")
+                    flows = live.FlowsByIp.TryGetValue(t.Ip, out int fc) ? fc : 0;
+                else
+                {
+                    liveInstances = live.InstancesForExe(t.Target);
+                    flows = live.FlowsForExe(t.Target);
+                }
                 string note = string.IsNullOrEmpty(t.Description) ? "" :
                     (t.Description.Length > 160 ? t.Description[..160] + "…" : t.Description);
                 if (t.StaleRules > 0)
@@ -850,6 +883,8 @@ namespace AutoCommand.Agent.Core
                     ["stale_rules"] = t.StaleRules,
                     ["created"] = t.Created?.ToString("yyyy-MM-dd HH:mm") ?? "legacy",
                     [$"hits_{minutes}m"] = h,
+                    ["live_instances"] = t.Kind == "ip" ? (int?)null : liveInstances,
+                    ["flows"] = flows,
                     ["gate_minutes_remaining"] = gate != null ? Math.Round(gate.RemainingMinutes, 1) : null,
                     ["note"] = note,
                 });
@@ -1439,6 +1474,93 @@ namespace AutoCommand.Agent.Core
             });
         }
 
+        // ── sever-on-block: close the flows a fresh block cannot touch ────
+
+        private static string SeverBlocked(JsonObject a)
+        {
+            var r = ResolveGateTarget(a["target"]?.GetValue<string>());
+            if (!r.Ok)
+                return ToJson(new JsonObject { ["error"] = r.Error, ["candidates"] = ToJsonArray(r.Candidates) });
+            bool dryRun = string.Equals(a["dry_run"]?.ToString(), "true", StringComparison.OrdinalIgnoreCase);
+
+            bool isIp = r.Kind == "ip";
+            string target = isIp ? r.Key : System.IO.Path.GetFileName(r.Key);
+            // The bridge's confirm dialog IS the ask-tier consent — the same
+            // contract open_gate carries: the user saw the exact instances.
+            var plan = isIp
+                ? SeverService.PlanByIp(target, allowAskTier: true)
+                : SeverService.PlanByName(target, allowAskTier: true);
+
+            var rows = new JsonArray();
+            foreach (var c in plan)
+                rows.Add(new JsonObject
+                {
+                    ["pid"] = c.Pid,
+                    ["name"] = c.Name,
+                    ["tier"] = c.Tier,
+                    ["flows"] = c.EstablishedFlows,
+                    ["path"] = c.ExePath,
+                    ["would_kill"] = c.SkipReason == null,
+                    ["skip_reason"] = c.SkipReason,
+                });
+
+            int killable = plan.Count(c => c.SkipReason == null);
+            int killableFlows = plan.Where(c => c.SkipReason == null).Sum(c => c.EstablishedFlows);
+
+            if (dryRun)
+                return ToJson(new JsonObject
+                {
+                    ["target"] = target,
+                    ["kind"] = r.Kind,
+                    ["would_kill"] = killable,
+                    ["established_flows"] = killableFlows,
+                    ["skipped"] = plan.Count - killable,
+                    ["instances"] = rows,
+                    ["note"] = "No change made. A real call asks the user to confirm these exact instances.",
+                });
+
+            var res = SeverService.Execute(plan, isIp ? "ip" : "proc", r.Key, "mcp");
+            try { AgentBridgeService.Instance.LogActivity("sever", "executed",
+                $"{target}: {res.Killed.Count} instance(s) killed, residual flows {res.ResidualFlows}"); } catch { }
+            return ToJson(new JsonObject
+            {
+                ["severed"] = true,
+                ["target"] = target,
+                ["killed"] = res.Killed.Count,
+                ["failed"] = res.Failed.Count,
+                ["skipped"] = res.Skipped.Count,
+                ["residual_flows"] = res.ResidualFlows,
+                ["instances"] = rows,
+                ["note"] = "Established flows severed; the block rule holds. Anything that respawns can only " +
+                           "make NEW connections, which the rule blocks.",
+            });
+        }
+
+        private static string SeverBlockedConfirmText(JsonObject a)
+        {
+            var r = ResolveGateTarget(a["target"]?.GetValue<string>());
+            if (!r.Ok) return "SEVER REQUEST - cannot be fulfilled as asked:\n" + r.Error;
+            bool isIp = r.Kind == "ip";
+            string target = isIp ? r.Key : System.IO.Path.GetFileName(r.Key);
+            var plan = isIp
+                ? SeverService.PlanByIp(target, allowAskTier: true)
+                : SeverService.PlanByName(target, allowAskTier: true);
+            var killable = plan.Where(c => c.SkipReason == null).ToList();
+            if (killable.Count == 0)
+                return "SEVER REQUEST - nothing to close: no running instances with established flows.\n" +
+                       "(The block rule already covers every new connection.)";
+
+            string table = string.Join("\n", killable.Select(c =>
+                "  pid " + c.Pid + "  " + c.Name + " - " + c.EstablishedFlows + " flow(s) [" + c.Tier + "]\n      " + c.ExePath));
+            int excluded = plan.Count - killable.Count;
+            return "Close " + killable.Count + " running instance(s) to sever established flows?\n\n" +
+                   table +
+                   (excluded > 0 ? "\n\n(" + excluded + " OS-critical/consent-tier instance(s) excluded by policy.)" : "") +
+                   "\n\nFirewall rules never sever established flows - these keep transmitting until they die.\n" +
+                   "Killing the instances closes them now; respawns start clean, inside the block. Children of\n" +
+                   "each instance close with it. The block stays ON.";
+        }
+
         private static JsonArray ToJsonArray(List<string> items)
         {
             if (items == null) return null;
@@ -1661,6 +1783,45 @@ namespace AutoCommand.Agent.Core
                 ["count_in_window"] = inv.BlockHitCount,
                 ["aggregates"] = hits,
             };
+
+            // UDP endpoint facet (UdpEndpointTable, ported from the
+            // systemmonitor ancestor): what the kernel's owner-pid UDP
+            // table can honestly say about this subject — which bound UDP
+            // sockets it holds, both families, one kernel instant. BOUND
+            // is the entire claim: no remote, no state, no bytes. A row
+            // here plus zero connect events is a bound-and-silent socket;
+            // transmit evidence stays with Sysmon EID 3 and trace_analyze.
+            try
+            {
+                var udpRows = UdpEndpointTable.GetBound();
+                var mine = new List<UdpEndpointTable.Row>();
+                if (inv.RequestedPid is int subjectPid)
+                {
+                    mine = udpRows.Where(r => r.Pid == subjectPid).ToList();
+                }
+                else if (!string.IsNullOrEmpty(inv.ImageName))
+                {
+                    // name-wide, same family semantics every other facet uses:
+                    // all instances of the image, every path
+                    string stem = inv.ImageName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                        ? inv.ImageName[..^4] : inv.ImageName;
+                    var pids = new HashSet<int>();
+                    foreach (var p in Process.GetProcessesByName(stem)) { try { pids.Add(p.Id); } finally { try { p.Dispose(); } catch { } } }
+                    mine = udpRows.Where(r => pids.Contains(r.Pid)).ToList();
+                }
+                if (mine.Count > 0 || inv.RequestedPid != null)
+                {
+                    var endpoints = new JsonArray(mine.Select(r => (JsonNode)r.LocalEndPoint).ToArray());
+                    o["udp_endpoints"] = new JsonObject
+                    {
+                        ["count"] = mine.Count,
+                        ["local_endpoints"] = endpoints,
+                        ["note"] = "bound UDP sockets (no remote/state in the kernel's owner-pid table) — " +
+                                   "bound ≠ transmitting; sends appear in Sysmon EID 3 / trace_analyze",
+                    };
+                }
+            }
+            catch { /* the facet degrades away; the investigation stands */ }
 
             var ev = new JsonArray(inv.Evidence.Select(e => (JsonNode)e).ToArray());
             o["evidence"] = ev;

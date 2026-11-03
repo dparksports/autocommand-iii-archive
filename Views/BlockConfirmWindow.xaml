@@ -16,6 +16,16 @@
         </Border>
         <TextBlock x:Name="DetailText" TextWrapping="Wrap" Margin="0,12,0,0" FontSize="12"
                    Foreground="{DynamicResource TextSecondaryBrush}"/>
+        <Border x:Name="SeverBorder" Background="#1431C48D" BorderBrush="#31C48D" BorderThickness="1"
+                CornerRadius="4" Padding="10,8" Margin="0,12,0,0" Visibility="Collapsed">
+            <StackPanel>
+                <CheckBox x:Name="SeverCheck" FontSize="12" FontWeight="SemiBold"
+                          Foreground="{DynamicResource TextPrimaryBrush}"
+                          ToolTip="Firewall rules stop NEW connections only — established flows keep transmitting until they die. Ticking this closes the listed instances so the block bites immediately; anything that respawns starts clean, inside the block. Each instance's child processes close with it."/>
+                <TextBlock x:Name="SeverCandidatesText" TextWrapping="Wrap" Margin="0,6,0,0" FontSize="11"
+                           Foreground="{DynamicResource TextSecondaryBrush}"/>
+            </StackPanel>
+        </Border>
         <CheckBox x:Name="SuppressCheck" Margin="0,14,0,0" FontSize="12"
                   Foreground="{DynamicResource TextPrimaryBrush}"
                   ToolTip="Applies to this class of block only. Undo anytime: 'Blocked' popup → 'Reset don't-ask-again choices'."/>

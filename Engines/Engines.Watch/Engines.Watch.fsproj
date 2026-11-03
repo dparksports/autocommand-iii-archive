@@ -24,6 +24,7 @@
     <Compile Include="Dns.fs" />
     <Compile Include="RowModel.fs" />
     <Compile Include="TcpTable.fs" />
+    <Compile Include="UdpEndpointTable.fs" />
     <Compile Include="Sniffer.fs" />
     <Compile Include="Capture.fs" />
     <Compile Include="SysmonArchive.fs" />

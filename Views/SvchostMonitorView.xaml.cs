@@ -1091,7 +1091,26 @@ namespace AutoCommand.Views
                 ConfirmPrefs.IsSuppressed(ConfirmPrefs.ConfirmIp) &&
                 (!msApplies || ConfirmPrefs.IsSuppressed(ConfirmPrefs.WarnMsInfra));
 
-            if (!confirmSuppressed)
+            // Sever plan BEFORE the dialog: the "also close" checkbox rides
+            // the same confirmation. Killable instances unsuppress the
+            // dialog — the don't-ask prefs silence the BLOCK warning, never
+            // the decision to kill. Never-tier instances are excluded by the
+            // planner and never listed; ticking the box consents to every
+            // listed instance, ask-tier components included.
+            var severPlan = await Task.Run(() => SeverService.PlanByIp(ip, allowAskTier: true));
+            var killable = severPlan.Where(c => c.SkipReason == null).ToList();
+            bool severRequested = false;
+            string severLabel = null, severCandidates = null;
+            if (killable.Count > 0)
+            {
+                int killableFlows = killable.Sum(c => c.EstablishedFlows);
+                severLabel = $"Also close the {killable.Count} process(es) still holding connections to this IP ({killableFlows} established flow(s))";
+                severCandidates = string.Join("\n",
+                    killable.Select(c => $"  pid {c.Pid}  {c.Name}  — {c.EstablishedFlows} flow(s)  [{c.Tier}]\n      {c.ExePath}"))
+                    + "\nClosing them severs the flows immediately; anything that respawns starts clean,\ninside the block. Each process's children close with it. Killing a browser here is\nintentional: its sockets to this IP live inside it.";
+            }
+
+            if (!confirmSuppressed || killable.Count > 0)
             {
                 string warning = msApplies && !ConfirmPrefs.IsSuppressed(ConfirmPrefs.WarnMsInfra)
                     ? msWarning + "\n\n⚠ Think twice: this IP is Microsoft infrastructure."
@@ -1106,8 +1125,10 @@ namespace AutoCommand.Views
                 string label = warning.Length > 0
                     ? "Don't warn me about Microsoft-infrastructure IPs — I know what I'm doing"
                     : "Don't ask again before blocking remote IPs";
-                if (!ConfirmBlockWithDialog($"Block all outbound traffic to remote IP {ip}?", warning, detail, key, label))
-                    return;
+                var win = ConfirmBlockWithDialog($"Block all outbound traffic to remote IP {ip}?", warning, detail, key, label,
+                                                 severLabel, severCandidates);
+                if (win == null) return;
+                severRequested = win.AlsoSever;
             }
 
             try
@@ -1116,10 +1137,18 @@ namespace AutoCommand.Views
                 var (created, updated) = await FirewallService.Instance.AddIpBlockAsync(ip, note);
                 RecordBlockedEntry(item, "ip", ip);
                 _ = RefreshBlockStateFromFirewallAsync();
-                ShowToast(created > 0
-                        ? $"⛔ Blocked remote IP {ip} — 2 rules (outbound TCP/UDP).\nProvenance written to the rule description (visible in wf.msc)."
-                        : $"Block for {ip} already existed — refreshed its provenance (no duplicate rules).",
-                    "ip", ip);
+                string toast = created > 0
+                    ? $"⛔ Blocked remote IP {ip} — 2 rules (outbound TCP/UDP).\nProvenance written to the rule description (visible in wf.msc)."
+                    : $"Block for {ip} already existed — refreshed its provenance (no duplicate rules).";
+
+                if (severRequested)
+                {
+                    var res = await Task.Run(() => SeverService.Execute(severPlan, "ip", ip, "blocks-tab"));
+                    toast += $"\n🗡 {res.Killed.Count} instance(s) closed — residual flows: {res.ResidualFlows}" +
+                             (res.Failed.Count > 0 ? $" ({res.Failed.Count} failed)" : "");
+                }
+
+                ShowToast(toast, "ip", ip);
             }
             catch (Exception ex)
             {
@@ -1198,7 +1227,32 @@ namespace AutoCommand.Views
                       : "") + "\n\n"
                 : "";
 
-            if (!confirmSuppressed)
+            // Sever plan BEFORE the dialog: the "also close" checkbox rides
+            // the same confirmation. Family-wide — the name-block covers
+            // every path the exe runs from (the same semantics
+            // AppBlockCoverageService enforces), so instances of the name at
+            // ANY path are candidates. Killable instances unsuppress the
+            // dialog — don't-ask prefs silence the BLOCK warning, never the
+            // decision to kill. Never-tier instances are excluded by the
+            // planner and never listed; ticking the box consents to every
+            // listed instance, ask-tier components included.
+            string exeName = System.IO.Path.GetFileName(path);
+            var severPlan = await Task.Run(() => SeverService.PlanByName(exeName, allowAskTier: true));
+            var killable = severPlan.Where(c => c.SkipReason == null).ToList();
+            int neverCount = severPlan.Count(c => c.Tier == ProcessKillPolicy.Never);
+            bool severRequested = false;
+            string severLabel = null, severCandidates = null;
+            if (killable.Count > 0)
+            {
+                int killableFlows = killable.Sum(c => c.EstablishedFlows);
+                severLabel = $"Also close {killable.Count} running instance(s) of {exeName} ({killableFlows} established flow(s))";
+                severCandidates = string.Join("\n",
+                    killable.Select(c => $"  pid {c.Pid}  {c.Name}  — {c.EstablishedFlows} flow(s)  [{c.Tier}]\n      {c.ExePath}"))
+                    + (neverCount > 0 ? $"\n  ({neverCount} OS-critical instance(s) excluded — never killed.)" : "")
+                    + "\nFirewall rules stop NEW connections only — established flows keep flowing until they die.\nClosing them severs the flows immediately; anything that respawns starts clean, inside the block.\nEach instance's child processes close with it.";
+            }
+
+            if (!confirmSuppressed || killable.Count > 0)
             {
                 string shownWarning = coreApplies && !ConfirmPrefs.IsSuppressed(ConfirmPrefs.WarnWindowsCore) ? warning : "";
                 string detail = exitedNote + $"{path}\n\n(1 outbound rule)\n" +
@@ -1207,12 +1261,13 @@ namespace AutoCommand.Views
                 string label = shownWarning.Length > 0
                     ? "Don't warn me about blocking Windows service hosts / components — I know what I'm doing"
                     : "Don't ask again before blocking processes";
-                if (!ConfirmBlockWithDialog(
+                var win = ConfirmBlockWithDialog(
                         target.SubjectExited
                             ? "Process already exited — block its executable for next time?"
                             : "Block all outbound network traffic for this process?",
-                        shownWarning, detail, key, label))
-                    return;
+                        shownWarning, detail, key, label, severLabel, severCandidates);
+                if (win == null) return;
+                severRequested = win.AlsoSever;
             }
 
             try
@@ -1236,6 +1291,18 @@ namespace AutoCommand.Views
                     : $"Block for {System.IO.Path.GetFileName(path)} already existed — provenance refreshed.";
                 if (target.SubjectExited)
                     toast += "\nThe process had already exited — the rule arms its next run.";
+
+                // Checked box = consent already given in the dialog: sever
+                // now, one kill here is a complete fix for the stale-flow
+                // class (respawns only make NEW connections, which this rule
+                // already blocks).
+                if (severRequested)
+                {
+                    var res = await Task.Run(() => SeverService.Execute(severPlan, "proc", path, "blocks-tab"));
+                    toast += $"\n🗡 Severed {res.Killed.Count} instance(s) — residual flows: {res.ResidualFlows}" +
+                             (res.Failed.Count > 0 ? $" ({res.Failed.Count} failed)" : "");
+                }
+
                 ShowToast(toast, "proc", path);
             }
             catch (Exception ex)
@@ -1246,19 +1313,22 @@ namespace AutoCommand.Views
 
         /// <summary>
         /// Shows the block confirmation window (warning + "don't ask again"
-        /// check-off). MessageBox cannot host the checkbox, hence the dialog;
-        /// a checked box persists the per-class suppression immediately.
+        /// check-off + the optional sever-on-block consent panel). MessageBox
+        /// cannot host the checkboxes, hence the dialog; a checked box
+        /// persists the per-class suppression immediately. Returns the window
+        /// (Confirmed / Suppress / AlsoSever) or null when cancelled.
         /// </summary>
-        private bool ConfirmBlockWithDialog(string headline, string warning, string detail,
-                                            string suppressKey, string suppressLabel)
+        private BlockConfirmWindow ConfirmBlockWithDialog(string headline, string warning, string detail,
+                                                          string suppressKey, string suppressLabel,
+                                                          string severLabel = null, string severCandidates = null)
         {
-            var win = new BlockConfirmWindow(headline, warning, detail, suppressKey, suppressLabel)
+            var win = new BlockConfirmWindow(headline, warning, detail, suppressKey, suppressLabel, severLabel, severCandidates)
             {
                 Owner = Window.GetWindow(this)
             };
-            if (win.ShowDialog() != true) return false;
+            if (win.ShowDialog() != true) return null;
             if (win.Suppress) ConfirmPrefs.Suppress(suppressKey);
-            return true;
+            return win;
         }
 
         /// <summary>Full provenance embedded into the firewall rule Description.</summary>
