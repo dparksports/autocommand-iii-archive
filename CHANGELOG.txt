@@ -2,6 +2,46 @@ AutoCommand III - release history
 All per-release notes consolidated here, newest first. No individual release_notes files remain in the repo; write a fresh one only for the next release (release.ps1 requires it).
 
 ================================================================================
+  2026.11.3  -  released 2026-11-03
+================================================================================
+
+# AutoCommand III — v2026.11.3
+
+Blocking now finishes the job: a firewall rule only stops NEW connections,
+so this release offers to close the running instances whose established
+flows the rule cannot touch - and the monitor line finally sees UDP, the
+piece the fork left behind.
+
+## What changed
+
+- **🗡 Sever-on-block.** Blocking a process or an IP from the monitor now
+  lists every running instance still holding connections (pid, flows, image
+  path, kill tier) with an "also close" checkbox - unchecked by default.
+  Ticking it creates the rules AND closes those instances tree-aware, so
+  the block bites immediately; respawns start clean, inside the block. Kill
+  tiers are policy: OS-critical processes (lsass, services, svchost...) are
+  refused even with consent, Windows components only behind the consent
+  that listed them by name. A pid-reuse guard re-checks each image at kill
+  time; a residual-flow verify loop reports what actually closed; every
+  sever lands as one line in blocks-events.log. Auto-block paths never
+  sever. Don't-ask prefs silence the block warning, never the kill
+  decision.
+- **sever_blocked on the AI bridge** - the same sever behind the same
+  per-call confirmation gate as open_gate (dry_run previews; never-tier
+  refused by policy). list_blocks rows now carry live_instances/flows:
+  what a sever would close, straight from the kernel socket table.
+- **UDP endpoints, at last.** Engines.Watch gains UdpEndpointTable
+  (GetExtendedUdpTable, IPv4 AND IPv6, race-checked) with owning pid -
+  investigate_process surfaces it as an udp_endpoints facet with the
+  honesty label it deserves: bound is not transmitting.
+- **Bridge: 411 rejections stopped RST-ing responses away.** A chunked
+  POST's terminator bytes sat unread at close, flipping FIN to RST -
+  intermittently costing the client the 411 body it was owed (caught as a
+  flaky self-test crash, 2 failures in 3 runs; 5/5 green after the fix).
+- **ContainSelfTest pins the kill policy offline** - 12 new checks over the
+  tier matrix and plan-decision table.
+
+================================================================================
   2026.10.31  -  released 2026-10-31
 ================================================================================
 
