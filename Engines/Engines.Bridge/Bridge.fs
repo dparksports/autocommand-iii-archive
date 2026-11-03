@@ -322,7 +322,16 @@ type AgentBridgeService (identity: AppIdentity, tools: IAgentTools,
                                     // the catch-all and close the socket with
                                     // NO response — clients read that as the
                                     // flaky "empty body" (field report). State
-                                    // the requirement instead.
+                                    // the requirement instead. Drain FIRST like
+                                    // the 401/403/413 rejections: a chunked
+                                    // request still has terminator bytes in
+                                    // flight, and closing with them unread
+                                    // makes Windows RST the connection — the
+                                    // client can lose the 411 body it was owed
+                                    // (BridgeSelfTest 3b's intermittent
+                                    // empty-body crash).
+                                    do! AgentBridgeService.DrainBody(stream, headers)
+                                    if chunked then do! AgentBridgeService.DrainAvailable(stream)
                                     do! AgentBridgeService.WriteJsonResponse(stream, 411,
                                         AgentBridgeService.RpcError(null, -32002, "Content-Length required (the bridge does not read chunked bodies)"))
                                 elif contentLength.Value > AgentBridgeService.MaxBodyBytes then
@@ -754,6 +763,26 @@ type AgentBridgeService (identity: AppIdentity, tools: IAgentTools,
                         let! n = stream.ReadAsync(buffer, 0, Math.Min(buffer.Length, total - read))
                         if n = 0 then draining <- false else read <- read + n
                     with _ -> draining <- false
+        } :> Task
+
+    /// <summary>Drain whatever has ARRIVED on the socket (bounded by
+    /// MaxBodyBytes, never blocking — DataAvailable-gated). The companion
+    /// for chunked requests, which carry no Content-Length DrainBody could
+    /// size: their terminator bytes still count as "unread at close" and
+    /// flip the close from FIN to RST, costing the client the response it
+    /// was owed.</summary>
+    static member private DrainAvailable (stream: NetworkStream) : Task =
+        task {
+            let buffer = Array.zeroCreate<byte> 8192
+            let mutable drained = 0
+            let mutable draining = true
+            while draining && drained < AgentBridgeService.MaxBodyBytes do
+                try
+                    if not stream.DataAvailable then draining <- false
+                    else
+                        let! n = stream.ReadAsync(buffer, 0, buffer.Length)
+                        if n = 0 then draining <- false else drained <- drained + n
+                with _ -> draining <- false
         } :> Task
 
     static member private WriteRaw (stream: NetworkStream, text: string) : Task =
